@@ -25,3 +25,4 @@
 #include "interfaces/apps_mem.def"
 #include "interfaces/apps_std.def"
 #include "interfaces/adsp_listener.def"
+#include "interfaces/sns_registry.def"

@@ -24,6 +24,7 @@
 #include <libhexagonrpc/fastrpc.h>
 #include <libhexagonrpc/interfaces/remotectl.def>
 #include <misc/fastrpc.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -42,6 +43,7 @@
 #include "listener.h"
 #include "localctl.h"
 #include "rpcd_builder.h"
+#include "sns_registry.h"
 
 static int remotectl_open(int fd, char *name, struct fastrpc_context **ctx, void (*err_cb)(const char *err))
 {
@@ -110,24 +112,28 @@ static void remotectl_err(const char *err)
 	fprintf(stderr, "Could not remotectl: %s\n", err);
 }
 
-static int register_fastrpc_listener(int fd)
+static struct fastrpc_context *register_fastrpc_listener(int fd)
 {
-	struct fastrpc_context *ctx;
+	struct fastrpc_context *ctx = NULL;
 	int ret;
 
 	ret = remotectl_open(fd, "adsp_default_listener", &ctx, remotectl_err);
 	if (ret)
-		return 1;
+		return NULL;
 
 	ret = adsp_default_listener_register(ctx);
 	if (ret) {
 		fprintf(stderr, "Could not register ADSP default listener\n");
-		goto err;
+		remotectl_close(ctx, remotectl_err);
+		return NULL;
 	}
 
-err:
-	remotectl_close(ctx, remotectl_err);
-	return ret;
+	/*
+	 * Keep the registration context alive while servicing reverse RPCs.
+	 * Qualcomm's Android listener daemon retains this handle for the
+	 * lifetime of its listener loop.
+	 */
+	return ctx;
 }
 
 static void print_usage(const char *argv0)
@@ -140,7 +146,21 @@ static void print_usage(const char *argv0)
 	       "\t-f DEVICE\tFastRPC device node to attach to\n"
 	       "\t-p PROGRAM\tRun client program with shared file descriptor\n"
 	       "\t-R DIR\t\tRoot directory of served files (default: /usr/share/qcom/)\n"
-	       "\t-s\t\tAttach to sensorspd\n");
+	       "\t-s\t\tAttach to sensorspd\n"
+	       "\t-S NAME\t\tCreate and attach to a static pd\n");
+}
+
+#define STATIC_PD_HEAP_SIZE (12 * 1024 * 1024)
+
+static int create_static_pd(int fd, const char *name)
+{
+	struct fastrpc_init_create_static init = {
+		.namelen = strlen(name) + 1,
+		.memlen = STATIC_PD_HEAP_SIZE,
+		.name = (__u64)(uintptr_t)name,
+	};
+
+	return ioctl(fd, FASTRPC_IOCTL_INIT_CREATE_STATIC, &init);
 }
 
 static int create_shell_pd(int fd, const char *create_shell)
@@ -252,10 +272,10 @@ static int start_clients(size_t n_progs, const char **progs, pid_t *pids)
 
 static void *start_reverse_tunnel(int fd, const char *device_dir, const char *dsp)
 {
+	struct fastrpc_context *listener_ctx;
 	struct fastrpc_interface **ifaces;
 	struct hexagonfs_dirent *root_dir;
-	size_t n_ifaces = 3;
-	int ret;
+	size_t n_ifaces = 4;
 
 	ifaces = malloc(sizeof(struct fastrpc_interface) * n_ifaces);
 	if (ifaces == NULL)
@@ -271,16 +291,19 @@ static void *start_reverse_tunnel(int fd, const char *device_dir, const char *ds
 	ifaces[REMOTECTL_HANDLE] = fastrpc_localctl_init(n_ifaces, ifaces);
 
 	// Dynamic interfaces with no hardcoded handle
-	ifaces[1] = fastrpc_apps_std_init(root_dir);
+	ifaces[1] = fastrpc_apps_std_init(root_dir, device_dir);
 	ifaces[2] = fastrpc_apps_mem_init(fd);
+	ifaces[3] = fastrpc_sns_registry_init();
 
-	ret = register_fastrpc_listener(fd);
-	if (ret)
+	listener_ctx = register_fastrpc_listener(fd);
+	if (listener_ctx == NULL)
 		goto err;
 
 	run_fastrpc_listener(fd, n_ifaces, ifaces);
 
+	remotectl_close(listener_ctx, remotectl_err);
 	fastrpc_localctl_deinit(ifaces[REMOTECTL_HANDLE]);
+	fastrpc_sns_registry_deinit(ifaces[3]);
 
 	free(ifaces);
 
@@ -412,6 +435,7 @@ int main(int argc, char* argv[])
 	const char *device_dir = "/usr/share/qcom/";
 	const char *dsp = "";
 	const char *create_shell = NULL;
+	const char *static_pd = NULL;
 	const char *guessed_device_dir;
 	const char **progs;
 	pid_t *pids;
@@ -435,7 +459,7 @@ int main(int argc, char* argv[])
 	if (guessed_device_dir != NULL)
 		device_dir = guessed_device_dir;
 
-	while ((opt = getopt(argc, argv, "c:d:f:p:R:s")) != -1) {
+	while ((opt = getopt(argc, argv, "c:d:f:p:R:sS:")) != -1) {
 		switch (opt) {
 			case 'c':
 				create_shell = optarg;
@@ -456,6 +480,9 @@ int main(int argc, char* argv[])
 			case 's':
 				attach_sns = true;
 				break;
+			case 'S':
+				static_pd = optarg;
+				break;
 			default:
 				print_usage(argv[0]);
 				goto err_free_pids;
@@ -467,7 +494,10 @@ int main(int argc, char* argv[])
 		goto err_free_pids;
 	}
 
-	printf("Starting %s (%s) on %s\n", argv[0], attach_sns? "INIT_ATTACH_SNS": "INIT_ATTACH", fastrpc_node);
+	printf("Starting %s (%s) on %s\n", argv[0],
+	       static_pd ? "INIT_CREATE_STATIC" :
+	       attach_sns ? "INIT_ATTACH_SNS" : "INIT_ATTACH",
+	       fastrpc_node);
 
 	fd = open(fastrpc_node, O_RDWR);
 	if (fd < 0) {
@@ -475,7 +505,9 @@ int main(int argc, char* argv[])
 		goto err_free_pids;
 	}
 
-	if (attach_sns)
+	if (static_pd != NULL)
+		ret = create_static_pd(fd, static_pd);
+	else if (attach_sns)
 		ret = ioctl(fd, FASTRPC_IOCTL_INIT_ATTACH_SNS, NULL);
 	else if (create_shell != NULL)
 		ret = create_shell_pd(fd, create_shell);

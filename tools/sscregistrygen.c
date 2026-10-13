@@ -221,6 +221,9 @@ void apply_sensor_configuration(struct config_filter *filter,
 
 	close(fd);
 
+	if (in == NULL)
+		return;
+
 	config = json_object_object_get(in, "config");
 	if (config != NULL) {
 		if (!check_config_filter(filter, config))

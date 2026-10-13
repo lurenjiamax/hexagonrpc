@@ -20,6 +20,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -139,12 +140,14 @@ err:
 	return ret;
 }
 
-int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd, const char *name)
+int hexagonfs_openat_flags(struct hexagonfs_fd **fds, int rootfd, int dirfd,
+			   const char *name, int flags, mode_t mode)
 {
 	struct hexagonfs_fd *fd;
 	const char *curr = name;
 	char *segment;
 	bool expect_dir;
+	bool final_segment;
 	int selected = dirfd;
 	int ret = 0;
 
@@ -163,11 +166,17 @@ int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd, const cha
 			ret = -ENOMEM;
 			goto err;
 		}
+		final_segment = (*curr == '\0');
 
 		if (!strcmp(segment, ".")) {
 			goto next;
 		} else if (!strcmp(segment, "..")) {
 			fd = pop_dir(fd, fds[rootfd]);
+		} else if (final_segment && fd->ops->openat_flags != NULL) {
+			ret = fd->ops->openat_flags(fd, segment, expect_dir,
+						    flags, mode, &fd);
+		} else if (final_segment && flags != O_RDONLY) {
+			ret = -EROFS;
 		} else {
 			ret = fd->ops->openat(fd, segment, expect_dir, &fd);
 		}
@@ -189,6 +198,12 @@ err:
 	destroy_file_descriptor(fd);
 
 	return ret;
+}
+
+int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd,
+		     const char *name)
+{
+	return hexagonfs_openat_flags(fds, rootfd, dirfd, name, O_RDONLY, 0);
 }
 
 int hexagonfs_close(struct hexagonfs_fd **fds, int fileno)
@@ -242,6 +257,41 @@ ssize_t hexagonfs_read(struct hexagonfs_fd **fds, int fileno, size_t size, void 
 		return -ENOSYS;
 
 	return fd->ops->read(fd, size, ptr);
+}
+
+ssize_t hexagonfs_write(struct hexagonfs_fd **fds, int fileno, size_t size,
+			const void *ptr)
+{
+	struct hexagonfs_fd *fd;
+
+	if (fileno < 0 || fileno >= HEXAGONFS_MAX_FD)
+		return -EBADF;
+
+	fd = fds[fileno];
+	if (fd == NULL)
+		return -EBADF;
+
+	if (fd->ops->write == NULL)
+		return -ENOSYS;
+
+	return fd->ops->write(fd, size, ptr);
+}
+
+int hexagonfs_ftruncate(struct hexagonfs_fd **fds, int fileno, off_t length)
+{
+	struct hexagonfs_fd *fd;
+
+	if (fileno < 0 || fileno >= HEXAGONFS_MAX_FD)
+		return -EBADF;
+
+	fd = fds[fileno];
+	if (fd == NULL)
+		return -EBADF;
+
+	if (fd->ops->truncate == NULL)
+		return -ENOSYS;
+
+	return fd->ops->truncate(fd, length);
 }
 
 int hexagonfs_readdir(struct hexagonfs_fd **fds, int fileno, size_t ent_size, char *ent)

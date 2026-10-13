@@ -20,12 +20,25 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include "hexagonfs.h"
+
+struct virt_dir_ctx {
+	const struct hexagonfs_dirent *const *entries;
+	size_t index;
+};
+
+static int virt_dir_openat_flags(struct hexagonfs_fd *dir,
+				 const char *segment,
+				 bool expect_dir,
+				 int flags,
+				 mode_t mode,
+				 struct hexagonfs_fd **out);
 
 /*
  * This function searches for the relevant path segment in the path directory.
@@ -48,14 +61,15 @@ static const struct hexagonfs_dirent *walk_dir(const struct hexagonfs_dirent *co
 
 static int virt_dir_from_dirent(const void *dirent_data, bool dir, void **fd_data)
 {
-	const struct hexagonfs_dirent *const **wrapper;
+	struct virt_dir_ctx *ctx;
 
-	wrapper = malloc(sizeof(*wrapper));
-	if (wrapper == NULL)
+	ctx = malloc(sizeof(*ctx));
+	if (ctx == NULL)
 		return -ENOMEM;
 
-	*wrapper = dirent_data;
-	*fd_data = wrapper;
+	ctx->entries = dirent_data;
+	ctx->index = 0;
+	*fd_data = ctx;
 
 	return 0;
 }
@@ -65,12 +79,23 @@ static int virt_dir_openat(struct hexagonfs_fd *dir,
 			   bool expect_dir,
 			   struct hexagonfs_fd **out)
 {
-	const struct hexagonfs_dirent *const **dirlist = dir->data;
+	return virt_dir_openat_flags(dir, segment, expect_dir,
+				      O_RDONLY, 0, out);
+}
+
+static int virt_dir_openat_flags(struct hexagonfs_fd *dir,
+				 const char *segment,
+				 bool expect_dir,
+				 int flags,
+				 mode_t mode,
+				 struct hexagonfs_fd **out)
+{
+	struct virt_dir_ctx *ctx = dir->data;
 	const struct hexagonfs_dirent *ent;
 	struct hexagonfs_fd *fd;
 	int ret;
 
-	ent = walk_dir(*dirlist, segment);
+	ent = walk_dir(ctx->entries, segment);
 	if (ent == NULL)
 		return -ENOENT;
 
@@ -82,7 +107,14 @@ static int virt_dir_openat(struct hexagonfs_fd *dir,
 	fd->up = dir;
 	fd->ops = ent->ops;
 
-	ret = ent->ops->from_dirent(ent->u.ptr, expect_dir, &fd->data);
+	if (ent->ops->from_dirent_flags != NULL) {
+		ret = ent->ops->from_dirent_flags(ent->u.ptr, expect_dir,
+						  flags, mode, &fd->data);
+	} else if (flags == O_RDONLY) {
+		ret = ent->ops->from_dirent(ent->u.ptr, expect_dir, &fd->data);
+	} else {
+		ret = -EROFS;
+	}
 	if (ret)
 		goto err;
 
@@ -100,6 +132,36 @@ static void virt_dir_close(void *fd_data)
 	free(fd_data);
 }
 
+static int virt_dir_readdir(struct hexagonfs_fd *fd, size_t size, char *out)
+{
+	struct virt_dir_ctx *ctx = fd->data;
+	const struct hexagonfs_dirent *ent;
+	const char *name;
+
+	if (size == 0)
+		return -EINVAL;
+
+	if (ctx->index == 0) {
+		name = ".";
+	} else if (ctx->index == 1) {
+		name = "..";
+	} else {
+		ent = ctx->entries[ctx->index - 2];
+		if (ent == NULL) {
+			out[0] = '\0';
+			return 0;
+		}
+
+		name = ent->name;
+	}
+
+	strncpy(out, name, size);
+	out[size - 1] = '\0';
+	ctx->index++;
+
+	return 0;
+}
+
 static int virt_dir_stat(struct hexagonfs_fd *fd, struct stat *stats)
 {
 	stats->st_size = 0;
@@ -110,7 +172,8 @@ static int virt_dir_stat(struct hexagonfs_fd *fd, struct stat *stats)
 	stats->st_ino = 0;
 	stats->st_nlink = 0;
 
-	stats->st_mode = S_IRUSR | S_IXUSR
+	stats->st_mode = S_IFDIR
+		       | S_IRUSR | S_IXUSR
 		       | S_IRGRP | S_IXGRP
 		       | S_IROTH | S_IXOTH;
 
@@ -128,5 +191,7 @@ struct hexagonfs_file_ops hexagonfs_virt_dir_ops = {
 	.close = virt_dir_close,
 	.from_dirent = virt_dir_from_dirent,
 	.openat = virt_dir_openat,
+	.openat_flags = virt_dir_openat_flags,
+	.readdir = virt_dir_readdir,
 	.stat = virt_dir_stat,
 };

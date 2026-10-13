@@ -25,7 +25,8 @@
 #include "hexagonfs.h"
 #include "listener.h"
 
-struct fastrpc_interface *fastrpc_apps_std_init(struct hexagonfs_dirent *root);
+struct fastrpc_interface *fastrpc_apps_std_init(struct hexagonfs_dirent *root,
+						const char *prefix);
 void fastrpc_apps_std_deinit(struct fastrpc_interface *iface);
 
 #endif

@@ -35,6 +35,18 @@ struct mapped_ctx {
 	DIR *dir;
 };
 
+static int mapped_from_dirent_flags(const void *dirent_data,
+				    bool dir,
+				    int flags,
+				    mode_t mode,
+				    void **fd_data);
+static int mapped_openat_flags(struct hexagonfs_fd *dir,
+			       const char *segment,
+			       bool expect_dir,
+			       int flags,
+			       mode_t mode,
+			       struct hexagonfs_fd **out);
+
 static void mapped_close(void *fd_data)
 {
 	struct mapped_ctx *ctx = fd_data;
@@ -49,9 +61,17 @@ static void mapped_close(void *fd_data)
 
 static int mapped_from_dirent(const void *dirent_data, bool dir, void **fd_data)
 {
+	return mapped_from_dirent_flags(dirent_data, dir, O_RDONLY, 0, fd_data);
+}
+
+static int mapped_from_dirent_flags(const void *dirent_data,
+				    bool dir,
+				    int flags,
+				    mode_t mode,
+				    void **fd_data)
+{
 	struct mapped_ctx *ctx;
 	const char *name = dirent_data;
-	int flags = O_RDONLY;
 	int ret;
 
 	ctx = malloc(sizeof(struct mapped_ctx));
@@ -61,7 +81,7 @@ static int mapped_from_dirent(const void *dirent_data, bool dir, void **fd_data)
 	if (dir)
 		flags |= O_DIRECTORY;
 
-	ctx->fd = open(name, flags);
+	ctx->fd = open(name, flags, mode);
 	if (ctx->fd == -1) {
 		ret = -errno;
 		goto err;
@@ -83,10 +103,19 @@ static int mapped_openat(struct hexagonfs_fd *dir,
 			 bool expect_dir,
 			 struct hexagonfs_fd **out)
 {
+	return mapped_openat_flags(dir, segment, expect_dir, O_RDONLY, 0, out);
+}
+
+static int mapped_openat_flags(struct hexagonfs_fd *dir,
+			       const char *segment,
+			       bool expect_dir,
+			       int flags,
+			       mode_t mode,
+			       struct hexagonfs_fd **out)
+{
 	struct mapped_ctx *dir_ctx = dir->data;
 	struct hexagonfs_fd *fd;
 	struct mapped_ctx *ctx;
-	int flags = O_RDONLY;
 	int ret;
 
 	ctx = malloc(sizeof(struct mapped_ctx));
@@ -102,7 +131,7 @@ static int mapped_openat(struct hexagonfs_fd *dir,
 	if (expect_dir)
 		flags |= O_DIRECTORY;
 
-	ctx->fd = openat(dir_ctx->fd, segment, flags);
+	ctx->fd = openat(dir_ctx->fd, segment, flags, mode);
 	if (ctx->fd == -1) {
 		ret = -errno;
 		goto err_free_fd;
@@ -136,6 +165,29 @@ static ssize_t mapped_read(struct hexagonfs_fd *fd, size_t size, void *out)
 		return -errno;
 
 	return ret;
+}
+
+static ssize_t mapped_write(struct hexagonfs_fd *fd, size_t size,
+			    const void *in)
+{
+	struct mapped_ctx *ctx = fd->data;
+	ssize_t ret;
+
+	ret = write(ctx->fd, in, size);
+	if (ret < 0)
+		return -errno;
+
+	return ret;
+}
+
+static int mapped_truncate(struct hexagonfs_fd *fd, off_t length)
+{
+	struct mapped_ctx *ctx = fd->data;
+
+	if (ftruncate(ctx->fd, length))
+		return -errno;
+
+	return 0;
 }
 
 static int mapped_readdir(struct hexagonfs_fd *fd, size_t size, char *out)
@@ -325,8 +377,12 @@ static int mapped_sysfs_stat(struct hexagonfs_fd *fd, struct stat *stats)
 struct hexagonfs_file_ops hexagonfs_mapped_ops = {
 	.close = mapped_close,
 	.from_dirent = mapped_from_dirent,
+	.from_dirent_flags = mapped_from_dirent_flags,
 	.openat = mapped_openat,
+	.openat_flags = mapped_openat_flags,
 	.read = mapped_read,
+	.write = mapped_write,
+	.truncate = mapped_truncate,
 	.readdir = mapped_readdir,
 	.seek = mapped_seek,
 	.stat = mapped_stat,
